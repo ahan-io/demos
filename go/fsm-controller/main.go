@@ -227,6 +227,7 @@ func main() {
 		data: map[string]*Resource{
 			"res-1": {ID: "res-1", Status: StateCreating, UpdatedAt: time.Now()},
 			"res-2": {ID: "res-2", Status: StateRunning, UpdatedAt: time.Now()},
+			"res-3": {ID: "res-3", Status: StateCreating, UpdatedAt: time.Now()},
 		},
 	}
 
@@ -243,6 +244,9 @@ func main() {
 	fmt.Println("\n--- External User action: Delete res-2 ---")
 	db.UpdateStatus("res-2", StateDeleting)
 	ctrl.Notify("res-2") // 立即通知控制器，不用等下个 5s 周期
+	time.Sleep(20 * time.Second)
+	db.UpdateStatus("res-3", StateDeleting)
+	ctrl.Notify("res-3") // 立即通知控制器，不用等下个 5s 周期
 
 	// 让程序运行一段时间观察输出
 	time.Sleep(60 * time.Second)
