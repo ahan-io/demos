@@ -46,6 +46,7 @@ func (db *MockDB) GetAll() []*Resource {
 func (db *MockDB) UpdateStatus(id string, status State) {
 	db.Lock()
 	defer db.Unlock()
+	// TODO 在实际项目中，这里还需要判断前置状态是否满足要求，即状态机的流转是否是合理的。
 	if r, ok := db.data[id]; ok {
 		r.Status = status
 		r.UpdatedAt = time.Now()
@@ -55,10 +56,17 @@ func (db *MockDB) UpdateStatus(id string, status State) {
 
 // ================= 控制器 (Controller) =================
 
+type workerEntry struct {
+	state  State
+	cancel context.CancelFunc
+}
+
 type Controller struct {
 	db       *MockDB
 	notifyCh chan string   // 用于接收外部通知的 Channel
 	interval time.Duration // 轮询周期
+	mu       sync.Mutex
+	workers  map[string]*workerEntry
 }
 
 func NewController(db *MockDB) *Controller {
@@ -66,6 +74,16 @@ func NewController(db *MockDB) *Controller {
 		db:       db,
 		notifyCh: make(chan string, 10),
 		interval: 5 * time.Second,
+		workers:  make(map[string]*workerEntry),
+	}
+}
+
+func needAsync(state State) bool {
+	switch state {
+	case StateCreating, StateDeleting:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -88,58 +106,116 @@ func (c *Controller) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			fmt.Println("🔍 Periodic scanning all resources...")
-			c.reconcileAll()
+			c.reconcileAll(ctx)
 		case id := <-c.notifyCh:
 			fmt.Printf("⚡ Event received for resource: %s\n", id)
-			c.reconcileOne(id)
+			c.reconcileOne(ctx, id)
 		}
 	}
 }
 
 // reconcileAll 扫描所有资源
-func (c *Controller) reconcileAll() {
+func (c *Controller) reconcileAll(ctx context.Context) {
 	resources := c.db.GetAll()
 	for _, r := range resources {
-		c.processState(r)
+		c.processState(ctx, r)
 	}
 }
 
 // reconcileOne 处理单个资源
-func (c *Controller) reconcileOne(id string) {
+func (c *Controller) reconcileOne(ctx context.Context, id string) {
 	// 实际场景下会从 DB 查出最新状态
 	c.db.RLock()
 	r, ok := c.db.data[id]
 	c.db.RUnlock()
 	if ok {
-		c.processState(r)
+		c.processState(ctx, r)
 	}
 }
 
 // processState 状态机核心逻辑：根据当前状态执行预期操作
-func (c *Controller) processState(r *Resource) {
-	switch r.Status {
-	case StateCreating:
-		fmt.Printf("🛠️  Handling CREATING for %s: Allocating infrastructure...\n", r.ID)
-		// 模拟操作成功后跳转到 Running
-		c.db.UpdateStatus(r.ID, StateRunning)
+func (c *Controller) processState(ctx context.Context, r *Resource) {
+	if needAsync(r.Status) {
+		c.ensureWorker(ctx, r.ID, r.Status)
+		return
+	}
 
+	switch r.Status {
 	case StateRunning:
 		fmt.Printf("🟢 Handling RUNNING for %s: Health checking...\n", r.ID)
 		// 如果检查失败，可以转为 Failed
-
-	case StateDeleting:
-		fmt.Printf("🗑️  Handling DELETING for %s: Releasing resources...\n", r.ID)
-		// 模拟删除完成后移出 DB
-		c.db.Lock()
-		delete(c.db.data, r.ID)
-		c.db.Unlock()
-		fmt.Printf("✅ Resource %s deleted.\n", r.ID)
 
 	case StateFailed:
 		fmt.Printf("❌ Handling FAILED for %s: Triggering alert or retry...\n", r.ID)
 
 	default:
 		fmt.Printf("❓ Unknown state for %s\n", r.ID)
+	}
+}
+
+func (c *Controller) ensureWorker(ctx context.Context, id string, state State) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if entry, ok := c.workers[id]; ok {
+		if entry.state == state {
+			fmt.Printf("⏭️  Worker already running for %s (%s)\n", id, state)
+			return
+		}
+
+		// 状态变化，取消旧 worker
+		// 如果已经资源已经有一个 worker 正在另外一个状态，为了避免冲突，我们调用 cancel 尽力取消后，等待 worker 结束，不启动新的协程。
+		fmt.Printf("🔄 State changed for %s: cancel %s worker\n", id, entry.state)
+		entry.cancel()
+		fmt.Printf("🚧 Wait for the worker of %s, it is running for state %s\n", id, entry.state)
+		return
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	c.workers[id] = &workerEntry{
+		state:  state,
+		cancel: cancel,
+	}
+
+	fmt.Printf("🚧 Starting %s worker for %s\n", state, id)
+	go c.resourceWorker(ctx, id, state)
+}
+
+func (c *Controller) resourceWorker(ctx context.Context, id string, state State) {
+	defer func() {
+		c.mu.Lock()
+		delete(c.workers, id)
+		c.mu.Unlock()
+		fmt.Printf("🧹 Worker for %s (%s) exited\n", id, state)
+	}()
+
+	switch state {
+
+	case StateCreating:
+		fmt.Printf("🛠️  Creating resource %s...\n", id)
+		select {
+		case <-time.After(4 * time.Second):
+			c.db.UpdateStatus(id, StateRunning)
+			fmt.Printf("✅ Resource %s created\n", id)
+
+		case <-ctx.Done():
+			fmt.Printf("⚠️  Creating worker for %s canceled\n", id)
+			return
+		}
+
+	case StateDeleting:
+		fmt.Printf("🗑️  Deleting resource %s...\n", id)
+		select {
+		case <-time.After(5 * time.Second):
+			c.db.Lock()
+			delete(c.db.data, id)
+			c.db.Unlock()
+			fmt.Printf("✅ Resource %s deleted\n", id)
+
+		case <-ctx.Done():
+			fmt.Printf("⚠️  Deleting worker for %s canceled\n", id)
+			return
+		}
 	}
 }
 
@@ -169,6 +245,6 @@ func main() {
 	ctrl.Notify("res-2") // 立即通知控制器，不用等下个 5s 周期
 
 	// 让程序运行一段时间观察输出
-	time.Sleep(10 * time.Second)
+	time.Sleep(60 * time.Second)
 	fmt.Println("Terminating demo...")
 }
